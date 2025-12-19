@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+psycopg2-binary
+sqlalchemy
+geoalchemy2
+asyncpg
+python-dotenv
+requests
+pandas
+pydantic-settings
+python-multipart
+openai
+# addresskr 
