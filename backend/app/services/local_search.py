@@ -5,15 +5,102 @@ from sqlalchemy import or_
 import re
 
 class LocalSearchService:
+    # 특례시 매핑 (양방향)
+    SPECIAL_CITY_MAP = {
+        "수원특례시": "수원시",
+        "용인특례시": "용인시",
+        "고양특례시": "고양시",
+        "창원특례시": "창원시",
+        # 역방향
+        "수원시": "수원특례시",
+        "용인시": "용인특례시",
+        "고양시": "고양특례시",
+        "창원시": "창원특례시",
+    }
+    
     def __init__(self, db: Session):
         self.db = db
+    
+    def _normalize_special_city(self, text: str) -> tuple[str, str | None]:
+        """
+        Normalize special city names for search.
+        Returns: (normalized_text, alternative_sgg)
+        - normalized_text: 검색어에서 특례시를 일반시로 변환
+        - alternative_sgg: DB 검색 시 사용할 대체 시군구명
+        """
+        alt_sgg = None
+        result = text
+        
+        for special, normal in [
+            ("수원특례시", "수원시"),
+            ("용인특례시", "용인시"),
+            ("고양특례시", "고양시"),
+            ("창원특례시", "창원시"),
+        ]:
+            if special in text:
+                result = text.replace(special, normal)
+                alt_sgg = special
+            elif normal in text:
+                alt_sgg = special  # DB에는 특례시로 저장되어 있을 수 있음
+        
+        return result, alt_sgg
+
+    def _insert_spaces(self, text: str) -> str:
+        """
+        Insert spaces in concatenated address strings.
+        e.g., "부산광역시남구수영로305" → "부산광역시 남구 수영로 305"
+        """
+        # If already has spaces, return as-is
+        if ' ' in text:
+            return text
+        
+        result = text
+        
+        # Insert space AFTER these patterns (Korean administrative boundaries)
+        patterns = [
+            (r'(특별시)', r'\1 '),
+            (r'(광역시)', r'\1 '),
+            (r'(특별자치시)', r'\1 '),
+            (r'(특별자치도)', r'\1 '),
+            (r'([가-힣]+도)(?=[가-힣])', r'\1 '),  # 경기도, 충청북도 등
+            (r'([가-힣]+시)(?=[가-힣]+[구군동])', r'\1 '),  # XX시 다음에 구/군/동이 오면
+            (r'([가-힣]+구)(?=[가-힣])', r'\1 '),  # 남구, 해운대구 등
+            (r'([가-힣]+군)(?=[가-힣])', r'\1 '),
+            (r'([가-힣]+읍)(?=[가-힣])', r'\1 '),
+            (r'([가-힣]+면)(?=[가-힣])', r'\1 '),
+            (r'([가-힣]+동)(?=[가-힣]+로|[가-힣]+길|\d)', r'\1 '),  # 동 다음에 로/길/숫자
+            (r'([가-힣]+로)(?=\d)', r'\1 '),  # 수영로305 → 수영로 305
+            (r'([가-힣]+길)(?=\d)', r'\1 '),  # XX길123 → XX길 123
+            (r'([가-힣]+대로)(?=\d)', r'\1 '),  # 세종대로175 → 세종대로 175
+        ]
+        
+        for pattern, replacement in patterns:
+            result = re.sub(pattern, replacement, result)
+        
+        # Clean up multiple spaces
+        result = re.sub(r'\s+', ' ', result).strip()
+        
+        return result
 
     def search(self, raw_query: str) -> NormalizationResult | None:
         """
         Search address in local DB using basic parsing and LIKE query.
         This is much faster than external API.
         """
-        # 0. Preprocess: Extract bracket content (reference info)
+        # 0-A. Preprocess: Insert spaces in concatenated input
+        # e.g., "부산광역시남구수영로305" → "부산광역시 남구 수영로 305"
+        processed_query = self._insert_spaces(raw_query)
+        if processed_query != raw_query:
+            print(f"[DEBUG] Space insertion: '{raw_query}' → '{processed_query}'")
+        raw_query = processed_query
+        
+        # 0-A2. Normalize special cities (특례시 처리)
+        # e.g., "수원시" → also search "수원특례시"
+        raw_query, alt_sgg = self._normalize_special_city(raw_query)
+        if alt_sgg:
+            print(f"[DEBUG] Special city detected: alt_sgg='{alt_sgg}'")
+        
+        # 0-B. Preprocess: Extract bracket content (reference info)
         # Pattern: "[연동, 대림2차아파트]" or "(연동)" 
         bracket_content = ""
         ref_building_name = None
@@ -102,10 +189,15 @@ class LocalSearchService:
             return any(ord('가') <= ord(c) <= ord('힣') for c in text)
 
         for i, t in enumerate(tokens):
-            # Detect Sido
-            for alias, full_name in sido_aliases.items():
-                if alias in t or full_name in t:
-                    sido_hint = full_name
+            # Skip road names from sido detection (e.g., 세종대로 should not match 세종)
+            is_road_name = t.endswith('로') or t.endswith('길') or t.endswith('대로')
+            
+            # Detect Sido - but not from road names
+            if not is_road_name:
+                for alias, full_name in sido_aliases.items():
+                    # Match exact token or full name, not substring in road name
+                    if t == alias or t == full_name or t.startswith(full_name):
+                        sido_hint = full_name
             
             # Detect Sgg
             if len(t) > 1 and (t.endswith('구') or t.endswith('군') or t.endswith('시')):
@@ -173,8 +265,16 @@ class LocalSearchService:
         if sido_hint:
             query = query.filter(AddressMaster.si_nm.like(f"{sido_hint}%"))
         if sgg_hint:
-            # Sgg might be partial matching or fuzzy
-            query = query.filter(AddressMaster.sgg_nm.like(f"%{sgg_hint}%"))
+            # Handle special city mapping (특례시 ↔ 일반시)
+            alt_sgg_for_query = self.SPECIAL_CITY_MAP.get(sgg_hint)
+            if alt_sgg_for_query:
+                # Search both: 수원시 OR 수원특례시
+                query = query.filter(or_(
+                    AddressMaster.sgg_nm.like(f"%{sgg_hint}%"),
+                    AddressMaster.sgg_nm.like(f"%{alt_sgg_for_query}%")
+                ))
+            else:
+                query = query.filter(AddressMaster.sgg_nm.like(f"%{sgg_hint}%"))
 
         # Scoring Logic: Prioritize checks that match Sido/Sgg even if not explicitly filtered?
         # For now, just trust the filter.
@@ -284,12 +384,16 @@ class LocalSearchService:
         tokens = clean_text.split()
         
         for t in tokens:
-             # Detect Sido
-             for alias, full_name in sido_aliases.items():
-                 if alias in t or full_name in t:
-                     sido_hint = full_name
+             # Skip road names from sido detection
+             is_road = t.endswith('로') or t.endswith('길') or t.endswith('대로')
              
-             # Detect Sgg
+             # Detect Sido - exact match only, not substring
+             if not is_road:
+                 for alias, full_name in sido_aliases.items():
+                     if t == alias or t == full_name or t.startswith(full_name):
+                         sido_hint = full_name
+             
+             # Detect Sgg - but exclude tokens containing sido alias as substring
              if len(t) > 1 and (t.endswith('구') or t.endswith('군') or t.endswith('시')):
                  if t not in sido_aliases.values() and "특별" not in t and "광역" not in t:
                     sgg_hint = t
@@ -431,12 +535,13 @@ class LocalSearchService:
     def search_candidates(self, query: str, limit: int = 10) -> list[dict]:
         """
         Search for address candidates matching the query.
-        Returns a list of candidate dictionaries for user selection.
+        Prioritizes: Road+Number > Building Name > Full text search
         """
-        from sqlalchemy import func
+        # Apply space insertion for concatenated input
+        query = self._insert_spaces(query)
         
         # Clean query
-        clean_query = re.sub(r'[^\w\s]', ' ', query).strip()
+        clean_query = re.sub(r'[^\w\s\-]', ' ', query).strip()
         while '  ' in clean_query:
             clean_query = clean_query.replace('  ', ' ')
         
@@ -444,7 +549,17 @@ class LocalSearchService:
         if not tokens:
             return []
         
-        # Detect hints
+        print(f"[DEBUG] search_candidates: tokens={tokens}")
+        
+        # Parse components
+        road_name = None
+        road_num = None
+        detail_dong = None  # 201동 같은 상세주소
+        building_name_hint = None
+        
+        sido_hint = None
+        sgg_hint = None
+        
         sido_aliases = {
             "서울": "서울특별시", "부산": "부산광역시", "대구": "대구광역시",
             "인천": "인천광역시", "광주": "광주광역시", "대전": "대전광역시",
@@ -454,57 +569,169 @@ class LocalSearchService:
             "경남": "경상남도", "제주": "제주특별자치도"
         }
         
-        sido_hint = None
-        sgg_hint = None
-        
-        for t in tokens:
-            for alias, full_name in sido_aliases.items():
-                if alias in t or full_name in t:
-                    sido_hint = full_name
-            if len(t) > 1 and (t.endswith('구') or t.endswith('군') or t.endswith('시')):
+        for i, t in enumerate(tokens):
+            # Road name detection (ends with 로/길/대로)
+            if t.endswith('로') or t.endswith('길') or t.endswith('대로'):
+                road_name = t
+                # Check next token for number
+                if i + 1 < len(tokens):
+                    next_t = tokens[i + 1]
+                    num_match = re.match(r'^(\d+)(?:-(\d+))?', next_t)
+                    if num_match:
+                        road_num = int(num_match.group(1))
+            
+            # Pure number (could be building number)
+            elif re.match(r'^\d+$', t) and not road_num:
+                road_num = int(t)
+            
+            # Detail dong pattern (숫자+동 like 201동, 101동)
+            elif re.match(r'^\d+동$', t):
+                detail_dong = t
+            
+            # Sido detection
+            is_road = t.endswith('로') or t.endswith('길') or t.endswith('대로')
+            if not is_road:
+                for alias, full_name in sido_aliases.items():
+                    if t == alias or t == full_name or t.startswith(full_name):
+                        sido_hint = full_name
+            
+            # Sgg detection
+            if len(t) > 1 and (t.endswith('구') or t.endswith('군')):
                 if t not in sido_aliases.values() and "특별" not in t and "광역" not in t:
                     sgg_hint = t
+            
+            # Building name hint (아파트, 빌딩, 타워 등 포함)
+            if '아파트' in t or '빌딩' in t or '타워' in t or '밸리' in t or '센터' in t or '오피스텔' in t:
+                building_name_hint = t
         
-        # Build search tokens (exclude detected hints)
-        search_tokens = [t for t in tokens if t != sido_hint and t != sgg_hint]
-        if not search_tokens:
-            search_tokens = tokens  # Fallback to all tokens
+        print(f"[DEBUG] Parsed: road={road_name}, num={road_num}, detail_dong={detail_dong}, building={building_name_hint}, sido={sido_hint}, sgg={sgg_hint}")
         
-        search_term = "%".join(search_tokens)
-        
-        # Query building names
-        q = self.db.query(AddressMaster)
-        
-        if sido_hint:
-            q = q.filter(AddressMaster.si_nm.like(f"{sido_hint}%"))
-        if sgg_hint:
-            q = q.filter(AddressMaster.sgg_nm.like(f"%{sgg_hint}%"))
-        
-        # Search in building name
-        q = q.filter(AddressMaster.buld_nm.like(f"%{search_term}%"))
-        
-        # Get distinct building names to avoid duplicates (same building, different units)
-        results = q.limit(limit * 5).all()  # Get more, then dedupe
-        
-        # Deduplicate by (road_full_addr)
-        seen = set()
         candidates = []
-        for r in results:
-            key = r.road_full_addr
-            if key not in seen:
-                seen.add(key)
-                candidates.append({
-                    "id": r.id,
-                    "road_address": r.road_full_addr,
-                    "jibun_address": r.jibun_full_addr,
-                    "building_name": r.buld_nm or "",
-                    "zip_code": r.zip_no,
-                    "si_nm": r.si_nm,
-                    "sgg_nm": r.sgg_nm,
-                    "emd_nm": r.emd_nm
-                })
-                if len(candidates) >= limit:
-                    break
         
+        # Strategy 1: Road Name + Number search (most precise)
+        if road_name and road_num:
+            q = self.db.query(AddressMaster)
+            q = q.filter(AddressMaster.road_nm == road_name)
+            q = q.filter(AddressMaster.buld_mainsn == road_num)
+            
+            if sido_hint:
+                q = q.filter(AddressMaster.si_nm.like(f"{sido_hint}%"))
+            if sgg_hint:
+                alt_sgg = self.SPECIAL_CITY_MAP.get(sgg_hint)
+                if alt_sgg:
+                    q = q.filter(or_(
+                        AddressMaster.sgg_nm.like(f"%{sgg_hint}%"),
+                        AddressMaster.sgg_nm.like(f"%{alt_sgg}%")
+                    ))
+                else:
+                    q = q.filter(AddressMaster.sgg_nm.like(f"%{sgg_hint}%"))
+            
+            results = q.limit(limit * 5).all()
+            
+            # Deduplicate
+            seen = set()
+            for r in results:
+                key = f"{r.road_full_addr}|{r.buld_nm}"
+                if key not in seen:
+                    seen.add(key)
+                    candidates.append(self._to_candidate(r))
+                    if len(candidates) >= limit:
+                        break
+        
+        # Strategy 2: Road Name only (if no number or Strategy 1 failed)
+        if not candidates and road_name:
+            q = self.db.query(AddressMaster)
+            q = q.filter(AddressMaster.road_nm.like(f"%{road_name}%"))
+            
+            if sido_hint:
+                q = q.filter(AddressMaster.si_nm.like(f"{sido_hint}%"))
+            if sgg_hint:
+                alt_sgg = self.SPECIAL_CITY_MAP.get(sgg_hint)
+                if alt_sgg:
+                    q = q.filter(or_(
+                        AddressMaster.sgg_nm.like(f"%{sgg_hint}%"),
+                        AddressMaster.sgg_nm.like(f"%{alt_sgg}%")
+                    ))
+                else:
+                    q = q.filter(AddressMaster.sgg_nm.like(f"%{sgg_hint}%"))
+            
+            results = q.limit(limit * 5).all()
+            
+            seen = set()
+            for r in results:
+                key = f"{r.road_full_addr}"
+                if key not in seen:
+                    seen.add(key)
+                    candidates.append(self._to_candidate(r))
+                    if len(candidates) >= limit:
+                        break
+        
+        # Strategy 3: Building name search
+        if not candidates and building_name_hint:
+            q = self.db.query(AddressMaster)
+            q = q.filter(AddressMaster.buld_nm.like(f"%{building_name_hint}%"))
+            
+            if sido_hint:
+                q = q.filter(AddressMaster.si_nm.like(f"{sido_hint}%"))
+            if sgg_hint:
+                alt_sgg = self.SPECIAL_CITY_MAP.get(sgg_hint)
+                if alt_sgg:
+                    q = q.filter(or_(
+                        AddressMaster.sgg_nm.like(f"%{sgg_hint}%"),
+                        AddressMaster.sgg_nm.like(f"%{alt_sgg}%")
+                    ))
+                else:
+                    q = q.filter(AddressMaster.sgg_nm.like(f"%{sgg_hint}%"))
+            
+            results = q.limit(limit * 5).all()
+            
+            seen = set()
+            for r in results:
+                key = f"{r.buld_nm}|{r.sgg_nm}"
+                if key not in seen:
+                    seen.add(key)
+                    candidates.append(self._to_candidate(r))
+                    if len(candidates) >= limit:
+                        break
+        
+        # Strategy 4: Fallback to building name search with any token
+        if not candidates:
+            # Find longest non-numeric, non-region token
+            search_tokens = [t for t in tokens 
+                           if not re.match(r'^\d+동?$', t) 
+                           and t not in [sido_hint, sgg_hint]
+                           and not t.endswith('로') and not t.endswith('길')]
+            
+            if search_tokens:
+                main_token = max(search_tokens, key=len)
+                
+                q = self.db.query(AddressMaster)
+                q = q.filter(AddressMaster.buld_nm.like(f"%{main_token}%"))
+                
+                results = q.limit(limit * 5).all()
+                
+                seen = set()
+                for r in results:
+                    key = f"{r.buld_nm}|{r.sgg_nm}"
+                    if key not in seen:
+                        seen.add(key)
+                        candidates.append(self._to_candidate(r))
+                        if len(candidates) >= limit:
+                            break
+        
+        print(f"[DEBUG] search_candidates: found {len(candidates)} candidates")
         return candidates
+
+    def _to_candidate(self, r: AddressMaster) -> dict:
+        """Convert AddressMaster to candidate dict"""
+        return {
+            "id": r.id,
+            "road_address": r.road_full_addr,
+            "jibun_address": r.jibun_full_addr,
+            "building_name": r.buld_nm or "",
+            "zip_code": r.zip_no,
+            "si_nm": r.si_nm,
+            "sgg_nm": r.sgg_nm,
+            "emd_nm": r.emd_nm
+        }
 

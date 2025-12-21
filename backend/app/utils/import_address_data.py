@@ -48,8 +48,8 @@ def load_extra_info(region_suffix):
     return info_map
 
 def load_jibun_info(region_suffix):
-    """ 3. 지번 (Jibun Number) """
-    # Map: { MgmtNo : "Main-Sub" }
+    """ 3. 지번 (Jibun Number + 법정동) """
+    # Map: { MgmtNo : { "jibun": "123-4", "emd": "하안동" } }
     jibun_map = {}
     fpath = os.path.join(DATA_DIR, f"지번_{region_suffix}")
     if not os.path.exists(fpath): return {}
@@ -59,18 +59,31 @@ def load_jibun_info(region_suffix):
         for line in f:
             cols = line.strip().split('|')
             if len(cols) < 11: continue
-            # 0: MgmtNo, 8: Main, 9: Sub, 10: RepFlag(1)
+            # Standard Layout:
+            # 0: 관리번호, 1: 일련번호, 2: 법정동코드
+            # 3: 시도명, 4: 시군구명, 5: 법정읍면동명 (★ 핵심!)
+            # 6: 법정리명, 7: 산여부, 8: 지번본번, 9: 지번부번, 10: 대표여부
             # Only use Representative Jibun (1) to keep it simple 1:1
             if cols[10] == '1':
                 mgmt_no = cols[0]
+                
+                # Extract legal dong name (법정읍면동명)
+                emd_name = cols[5].strip() if len(cols) > 5 else ""
+                
+                # Extract jibun number
                 main_no = int(cols[8]) if cols[8].isdigit() else 0
                 sub_no = int(cols[9]) if cols[9].isdigit() else 0
                 
                 jibun_str = f"{main_no}"
                 if sub_no > 0:
                     jibun_str += f"-{sub_no}"
-                jibun_map[mgmt_no] = jibun_str
+                
+                jibun_map[mgmt_no] = {
+                    "jibun": jibun_str,
+                    "emd": emd_name
+                }
     return jibun_map
+
 
 def load_english_info(region_key):
     """
@@ -302,7 +315,14 @@ def import_addresses():
                          elif len(cols) > 9 and cols[9].strip():
                              buld_nm = cols[9].strip()
 
-                    jibun_num = jibun_map.get(mgmt_no, "") # ex: "123-4"
+                    jibun_data = jibun_map.get(mgmt_no, {})
+                    jibun_num = jibun_data.get("jibun", "") if isinstance(jibun_data, dict) else jibun_data
+                    
+                    # Use legal dong from jibun file (accurate per address)
+                    # Fall back to road_map emd if not available
+                    actual_emd = jibun_data.get("emd", "") if isinstance(jibun_data, dict) else ""
+                    if actual_emd:
+                        emd = actual_emd  # Override with accurate emd!
                     
                     # English Address Data
                     eng_data = eng_map.get(mgmt_no, {})
@@ -317,8 +337,7 @@ def import_addresses():
                     if sub_sn > 0: road_addr += f"-{sub_sn}"
                     if is_basement != '0': road_addr += " (지하)"
                     
-                    # Jibun Addr
-                    # Combine Region + EMD + (Jibun Number from File or empty)
+                    # Jibun Addr - now uses correct emd
                     jibun_addr = f"{sido} {sgg} {emd}"
                     if jibun_num:
                         jibun_addr += f" {jibun_num}"

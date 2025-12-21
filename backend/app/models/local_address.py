@@ -1,5 +1,4 @@
-from sqlalchemy import Column, Integer, String, Index, ForeignKey
-from sqlalchemy.orm import relationship
+from sqlalchemy import Column, Integer, String, Index
 from app.db.session import Base
 
 class AddressMaster(Base):
@@ -30,8 +29,8 @@ class AddressMaster(Base):
     road_nm_eng = Column(String, nullable=True, index=True) # Road Name (Teheran-ro)
     road_full_addr_eng = Column(String, nullable=True)      # Full English Address
     
-    # Relationship to Detail Addresses
-    details = relationship("AddressDetail", back_populates="master")
+    # Note: Relationship removed for import stability
+    # Query detail addresses via mgmt_no join when needed
 
     # Search Optimization (Index for quick like match)
     __table_args__ = (
@@ -45,7 +44,7 @@ class AddressDetail(Base):
     __tablename__ = "address_detail"
 
     id = Column(Integer, primary_key=True, index=True)
-    mgmt_no = Column(String, ForeignKey("address_master.mgmt_no"), index=True)  # 연계키
+    mgmt_no = Column(String, index=True)  # 연계키 (FK 제거 - Import 안정성)
     
     # Detail Address Fields
     dong = Column(String, nullable=True)       # 동명칭 (101동)
@@ -57,8 +56,8 @@ class AddressDetail(Base):
     # Full detail string for display
     detail_full = Column(String, nullable=True)  # 전체 상세주소 문자열
     
-    # Relationship
-    master = relationship("AddressMaster", back_populates="details")
+    # Note: Relationship removed for import stability
+    # Join via mgmt_no when querying
     
     __table_args__ = (
         Index('ix_detail_search', 'mgmt_no', 'dong', 'ho'),

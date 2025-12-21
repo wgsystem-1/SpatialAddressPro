@@ -1,6 +1,4 @@
 # Excel temp files
-~$*.xlsx
-~$*.xls
 *.xlsx
 *.xls
 
