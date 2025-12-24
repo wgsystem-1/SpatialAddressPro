@@ -69,6 +69,8 @@ def load_jibun_info(region_suffix):
                 
                 # Extract legal dong name (법정읍면동명)
                 emd_name = cols[5].strip() if len(cols) > 5 else ""
+                # Extract legal ri name (법정리명)
+                ri_name = cols[6].strip() if len(cols) > 6 else ""
                 
                 # Extract jibun number
                 main_no = int(cols[8]) if cols[8].isdigit() else 0
@@ -80,7 +82,8 @@ def load_jibun_info(region_suffix):
                 
                 jibun_map[mgmt_no] = {
                     "jibun": jibun_str,
-                    "emd": emd_name
+                    "emd": emd_name,
+                    "ri": ri_name
                 }
     return jibun_map
 
@@ -337,8 +340,11 @@ def import_addresses():
                     if sub_sn > 0: road_addr += f"-{sub_sn}"
                     if is_basement != '0': road_addr += " (지하)"
                     
-                    # Jibun Addr - now uses correct emd
+                    # Jibun Addr - now uses correct emd and optional ri
+                    actual_ri = jibun_data.get("ri", "") if isinstance(jibun_data, dict) else ""
                     jibun_addr = f"{sido} {sgg} {emd}"
+                    if actual_ri:
+                        jibun_addr += f" {actual_ri}"
                     if jibun_num:
                         jibun_addr += f" {jibun_num}"
                     

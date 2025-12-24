@@ -39,11 +39,20 @@ class LocalSearchService:
         "제주": "제주특별자치도", "제주도": "제주특별자치도", "제주특별자치도": "제주특별자치도"
     }
     
-    def _parse_region_hints(self, tokens: list[str]) -> tuple[str | None, str | None]:
-        """토큰 목록에서 시도/시군구 힌트를 추출"""
+    def _parse_region_hints(self, tokens: list[str]) -> tuple[str | None, str | None, str | None, str | None]:
+        """토큰 목록에서 시도/시군구/읍면동/리 힌트를 추출"""
         sido_hint = None
         sgg_hint = None
-        
+        emd_hint = None
+        ri_hint = None
+
+        # Helper to find Ri (Rural village)
+        for t in tokens:
+            if t.endswith('리') and len(t) > 1 and not t[0].isdigit():
+                ri_hint = t
+                break
+
+        # 1. Detect Sido
         for i, t in enumerate(tokens):
             # 도로명은 제외 (예: 세종대로에서 '세종'이 시도로 인식되는 것 방지)
             if t.endswith('로') or t.endswith('길') or t.endswith('대로'):
@@ -53,8 +62,6 @@ class LocalSearchService:
             found_sido = False
             for alias, full_name in self.SIDO_MAP.items():
                 if t == alias or t.startswith(alias):
-                    # '제주'로 시작하는 '제주시' 같은 경우, '제주'는 시도로, '제주시'에서 '제주'를 뺀 '시'가 남음
-                    # 하지만 보통 '제주 제주시'로 입력하므로 t == alias 체크가 안전
                     if t == alias or t == full_name:
                         sido_hint = full_name
                         found_sido = True
@@ -68,16 +75,26 @@ class LocalSearchService:
                             found_sido = True
                             break
             
+            # 1-2. Typo correction (e.g. "주특별자치도" -> "제주특별자치도")
+            if not found_sido and t == "주특별자치도":
+                sido_hint = "제주특별자치도"
+                found_sido = True
+
             if found_sido:
                 continue
 
-            # 2. 시군구 검색 (시도 검색 안 된 경우)
-            if len(t) > 1 and (t.endswith('시') or t.endswith('군') or t.endswith('구')):
-                # '광역시', '특별' 등은 시도가 아니므로 제외
-                if t not in self.SIDO_MAP.values() and "특별" not in t and "광역" not in t:
-                    sgg_hint = t
+            # 2. 시군구/읍면동 검색 (시도 검색 안 된 경우)
+            if len(t) > 1:
+                # Sgg check
+                if t.endswith('시') or t.endswith('군') or t.endswith('구'):
+                    if t not in self.SIDO_MAP.values() and "특별" not in t and "광역" not in t:
+                        if not sgg_hint: sgg_hint = t
+                # Emd check
+                elif t.endswith('읍') or t.endswith('면') or t.endswith('동'):
+                    if not t[0].isdigit() and not emd_hint:
+                        emd_hint = t
         
-        return sido_hint, sgg_hint
+        return sido_hint, sgg_hint, emd_hint, ri_hint
     
     def __init__(self, db: Session):
         self.db = db
@@ -133,10 +150,7 @@ class LocalSearchService:
         Insert spaces in concatenated address strings.
         e.g., "부산광역시남구수영로305" → "부산광역시 남구 수영로 305"
         """
-        # If already has spaces, return as-is
-        if ' ' in text:
-            return text
-        
+        # Even if has spaces, we might need to split some parts (e.g. '로304번')
         result = text
         
         # Insert space AFTER these patterns (Korean administrative boundaries)
@@ -151,10 +165,14 @@ class LocalSearchService:
             (r'([가-힣]+군)(?=[가-힣])', r'\1 '),
             (r'([가-힣]+읍)(?=[가-힣])', r'\1 '),
             (r'([가-힣]+면)(?=[가-힣])', r'\1 '),
+            (r'([가-힣]+리)(?=[가-힣]|\d)', r'\1 '),  # 하귀리1-1 → 하귀리 1-1
             (r'([가-힣]+동)(?=[가-힣]+로|[가-힣]+길|\d)', r'\1 '),  # 동 다음에 로/길/숫자
-            (r'([가-힣]+로)(?=\d)', r'\1 '),  # 수영로305 → 수영로 305
-            (r'([가-힣]+길)(?=\d)', r'\1 '),  # XX길123 → XX길 123
-            (r'([가-힣]+대로)(?=\d)', r'\1 '),  # 세종대로175 → 세종대로 175
+            # Do NOT split "로NN번길" -> it's often a single road name.
+            # Only split if it's "로" followed by digits NOT ending in "번길"
+            (r'([가-힣]+로)(\d+)(?!번길)', r'\1 \2'),  
+            (r'([가-힣]+길)(\d+)', r'\1 \2'),
+            (r'([가-힣]+대로)(\d+)', r'\1 \2'),
+            (r'(\d+)(번지?|호|동|층)', r'\1 \2'),  # 304번 → 304 번, 101호 → 101 호
         ]
         
         for pattern, replacement in patterns:
@@ -209,13 +227,47 @@ class LocalSearchService:
                 # Single item in bracket - could be dong or building
                 if '동' not in bracket_content or '아파트' in bracket_content:
                     ref_building_name = bracket_content.strip()
+            
+            # 0-B2. If bracket looks like Jibun (Contains 'Ri' or 'Dong' and Numbers)
+            # e.g., [구억리, 1159-0]
+            if ',' in bracket_content:
+                jb_parts = [p.strip() for p in bracket_content.split(',')]
+                jb_emd = None
+                jb_num = None
+                for p in jb_parts:
+                    if p.endswith('리') or p.endswith('동') or p.endswith('읍') or p.endswith('면'):
+                        jb_emd = p
+                    if re.match(r'^\d+(?:-\d+)?$', p):
+                        jb_num = p
+                
+                if jb_emd and jb_num:
+                    # Normalize -0 to just the main number (e.g. 486-0 -> 486)
+                    if jb_num.endswith('-0'):
+                        jb_num = jb_num[:-2]
+                        
+                    print(f"[DEBUG] Priority Jibun Search from bracket: {jb_emd} {jb_num}")
+                    # Try a quick search with this info
+                    q_jb = self.db.query(AddressMaster).filter(AddressMaster.jibun_full_addr.like(f"%{jb_emd}% {jb_num}%"))
+                    if sido_hint: q_jb = q_jb.filter(AddressMaster.si_nm.like(f"{sido_hint}%"))
+                    if sgg_hint: q_jb = q_jb.filter(AddressMaster.sgg_nm.like(f"%{sgg_hint}%"))
+                    res_jb = q_jb.first()
+                    if res_jb:
+                        return self._to_result(res_jb)
         
         # Remove bracket content from query for cleaner parsing
         clean_query = re.sub(r'\[[^\]]+\]', ' ', raw_query)
         clean_query = re.sub(r'\([^\)]+\)', ' ', clean_query)  # Also remove ()
         
-        # Strip "번지" from numbers like "329-10번지" -> "329-10"
-        clean_query = re.sub(r'(\d+(?:-\d+)?)\s*번지', r'\1', clean_query)
+        # Clean redundant regional names (e.g. "제주시 ... 제주시")
+        # Find hints
+        sh, sgh, eh, rh = self._parse_region_hints(clean_query.split())
+        if sh: clean_query = re.sub(f'\\s{sh}\\s', ' ', f' {clean_query} ', count=1).strip()
+        if sgh: clean_query = re.sub(f'\\s{sgh}\\s', ' ', f' {clean_query} ', count=1).strip()
+        # Ensure we keep at least one mention if we just deleted everything, but actually _parse_region_hints
+        # already extracted them. Let's just normalize the query to avoid double counting.
+        
+        # Strip "번지" or "번" from numbers
+        clean_query = re.sub(r'(\d+(?:-\d+)?)\s*(?:번지|번)', r'\1', clean_query)
         
         # Handle numbers stuck to brackets: "25[연동]" -> "25 "
         clean_query = re.sub(r'(\d+)\s*\[', r'\1 ', clean_query)
@@ -269,7 +321,7 @@ class LocalSearchService:
         # Extract road name (scan parts)
         # Also try to extract Region (Sido) and District (Sgg) for better filtering
         # 1.1 Extract Region (Sido) and District (Sgg) for better filtering
-        sido_hint, sgg_hint = self._parse_region_hints(tokens)
+        sido_hint, sgg_hint, emd_hint, ri_hint = self._parse_region_hints(tokens)
 
         # Helper to check if string contains Korean
         def has_korean(text):
@@ -449,14 +501,7 @@ class LocalSearchService:
         while '  ' in clean_text: clean_text = clean_text.replace('  ', ' ')
         tokens = clean_text.split()
         
-        sido_hint, sgg_hint = self._parse_region_hints(tokens)
-
-        for t in tokens:
-             # Detect Dong (EMD) - must end with '동' and NOT start with digits (to avoid building dong like 205동)
-             if len(t) > 1 and t.endswith('동') and not t[0].isdigit():
-                 # Don't overwrite if we already found a likely EMD (EMD usually comes first)
-                 if not emd_hint:
-                     emd_hint = t
+        sido_hint, sgg_hint, emd_hint, ri_hint = self._parse_region_hints(tokens)
 
 
         
@@ -466,13 +511,17 @@ class LocalSearchService:
         # This helps ignore "tail" info like "101ho", "building name" etc.
         core_tokens = []
         for t in tokens:
+            # Skip ANY regional hints at any position to handle redundant inputs
+            if t == sido_hint or t == sgg_hint or t == ri_hint:
+                continue
+            # Also check against SIDO_MAP aliases for safety
+            if t in self.SIDO_MAP or t in self.SIDO_MAP.values():
+                continue
+                
             # If token is a number (e.g. 329-10)
             if re.match(r'^\d+(?:-\d+)?$', t):
                 core_tokens.append(t)
                 break
-            # Skip region hints already captured
-            if t == sido_hint or t == sgg_hint:
-                continue
             
             # To handle "일도2동" vs "일도이동", replace digits with %
             # This makes "일도2동" -> "일도%동" or "일도이동" -> "일도%동"
@@ -485,31 +534,38 @@ class LocalSearchService:
         core_query_part = "%".join(core_tokens)
         
         # 3. Tiered Search
-        def try_search(use_sido=True, use_sgg=True):
+        def try_search(use_sido=True, use_sgg=True, use_ri=True):
             q = self.db.query(AddressMaster)
             if use_sido and sido_hint:
                 q = q.filter(AddressMaster.si_nm.like(f"{sido_hint}%"))
             if use_sgg and sgg_hint:
                 q = q.filter(AddressMaster.sgg_nm.like(f"%{sgg_hint}%"))
             
-            # Separate text and number parts
-            text_part = "%".join(core_tokens[:-1])
-            num_part = core_tokens[-1]
+            text_tokens = core_tokens[:-1]
+            if use_ri and ri_hint and ri_hint not in text_tokens:
+                # Normalize 'Ri' variations (1리, 일리 -> %리)
+                norm_ri = re.sub(r'(\d+|일|이|삼|사|오|육|칠|팔|구|십)리', '%리', ri_hint)
+                text_tokens.append(norm_ri)
             
-            # Since jibun_full_addr usually ends with " [Main]-[Sub]",
-            # we try strict match with a leading space to avoid matching 1069-1 when searching 9-1.
+            # If EMD hint is available and not in text_tokens, add it to broaden search
+            if emd_hint and emd_hint not in text_tokens:
+                 text_tokens.insert(0, emd_hint)
             
+            text_part = "%".join(text_tokens)
+            num_part = core_tokens[-1] if core_tokens else ""
+            
+            if not num_part and not text_part: return None
+
             if is_jibun_likely:
                 # 1. Strict number match (preceded by space AND ends with the number)
-                # This prevents '1506' from matching '1506-11'
                 res = q.filter(AddressMaster.jibun_full_addr.like(f"%{text_part}% {num_part}")).first()
                 if not res:
-                    # 2. Fallback to loose match only if strict fails
+                    # 2. Fallback to loose match
                     res = q.filter(AddressMaster.jibun_full_addr.like(f"%{text_part}% {num_part}%")).first()
                 if not res:
                     res = q.filter(AddressMaster.road_full_addr.like(f"%{text_part}%{num_part}%")).first()
             else:
-                # Road search preferred - also try strict first
+                # Road search preferred
                 res = q.filter(AddressMaster.road_full_addr.like(f"%{text_part}% {num_part}")).first()
                 if not res:
                     res = q.filter(AddressMaster.road_full_addr.like(f"%{text_part}%{num_part}%")).first()
@@ -517,14 +573,15 @@ class LocalSearchService:
                     res = q.filter(AddressMaster.jibun_full_addr.like(f"%{text_part}%{num_part}%")).first()
             return res
 
-        # Attempt 1: Full context
-        match = try_search(True, True)
+        # Tiered Strategy:
+        # Full (Sido+Sgg+Ri) -> (Sido+Sgg) -> (Sgg only) -> (Global)
+        match = try_search(True, True, True)
+        if not match and ri_hint:
+            match = try_search(True, True, False) # Skip Ri (in case DB missing it)
         if not match:
-            # Attempt 2: Relax Sido (Maybe just "제주시 ...")
-            match = try_search(False, True)
+            match = try_search(False, True, False) # Relax Sido
         if not match:
-            # Attempt 3: Relax All Region (Last resort)
-            match = try_search(False, False)
+            match = try_search(False, False, False) # Global
 
         if match:
             return self._to_result(match)
@@ -602,9 +659,18 @@ class LocalSearchService:
         if obj.buld_subsn > 0:
             road_str += f"-{obj.buld_subsn}"
             
+        # Format bracket info for refined address
+        # If jibul_full_addr contains more detail than emd_nm (like Ri)
+        # Try to find Ri in jibun_full_addr
+        bracket_info = obj.emd_nm
+        # Look for the part after emd_nm that ends with '리'
+        ri_match = re.search(f"{obj.emd_nm}\\s+([가-힣]+리)", obj.jibun_full_addr)
+        if ri_match:
+            bracket_info = f"{obj.emd_nm} {ri_match.group(1)}"
+
         return NormalizationResult(
             success=True,
-            refined_address=f"{road_str} ({obj.emd_nm})",
+            refined_address=f"{road_str} ({bracket_info})",
             road_address=road_str,
             jibun_address=obj.jibun_full_addr, # FIXED: jibun_addr -> jibun_full_addr
             zip_code=obj.zip_no,
