@@ -48,6 +48,11 @@ function App() {
     filename: string;
   } | null>(null)
 
+  // Bulk processing state
+  const [bulkProcessing, setBulkProcessing] = useState(false)
+  const [bulkProgress, setBulkProgress] = useState({ current: 0, total: 0, percent: 0 })
+  const [currentJobId, setCurrentJobId] = useState<string | null>(null)
+
   // Search for candidates (building name search)
   const handleSearch = async () => {
     if (!inputText.trim()) return
@@ -127,30 +132,73 @@ function App() {
     if (!file) return
 
     setLoading(true)
+    setBulkProcessing(true)
     setError('')
-    setBulkData(null) // Reset previous bulk data
-    setResult(null)   // Reset single result
+    setBulkData(null)
+    setResult(null)
+    setBulkProgress({ current: 0, total: 0, percent: 0 })
 
     const formData = new FormData()
     formData.append('file', file)
 
     try {
-      // Expect JSON response now, not blob
+      // 1. Start job
       const response = await axios.post('/api/v1/address/bulk-normalize', formData)
+      const jobId = response.data.job_id
+      setCurrentJobId(jobId)
 
-      const data = response.data
-      setBulkData(data)
+      // 2. Poll for status
+      const poll = setInterval(async () => {
+        try {
+          const statusRes = await axios.get(`/api/v1/address/bulk-status/${jobId}`)
+          const statusData = statusRes.data
 
-      if (data.count > 100) {
-        alert(`Process complete! ${data.count} addresses processed. Please download the CSV.`)
-      }
+          setBulkProgress({
+            current: statusData.current_row,
+            total: statusData.total_rows,
+            percent: statusData.progress_percent
+          })
 
-    } catch (err) {
+          if (!statusData.is_running) {
+            clearInterval(poll)
+            setBulkProcessing(false)
+            setLoading(false)
+
+            if (statusData.is_cancelled) {
+              setError('처리가 사용자에 의해 중단되었습니다.')
+            } else if (statusData.results_data) {
+              setBulkData(statusData.results_data)
+              alert(`처리 완료! ${statusData.results_data.count}건 정규화됨.`)
+            }
+          }
+        } catch (err) {
+          console.error('Polling error:', err)
+          clearInterval(poll)
+          setBulkProcessing(false)
+          setLoading(false)
+        }
+      }, 800)
+
+    } catch (err: any) {
       console.error(err)
-      setError('Bulk processing failed. (대량 처리 실패)')
-    } finally {
+      const errMsg = err.response?.data?.detail || 'Bulk processing failed.'
+      setError(errMsg)
+      setBulkProcessing(false)
       setLoading(false)
+    } finally {
       event.target.value = ''
+    }
+  }
+
+  const handleCancelBulk = async () => {
+    if (!currentJobId) return
+    try {
+      const res = await axios.post(`/api/v1/address/bulk-cancel/${currentJobId}`)
+      if (res.data.success) {
+        // Status will be updated via polling
+      }
+    } catch (err) {
+      console.error('Cancel failed:', err)
     }
   }
 
@@ -174,11 +222,7 @@ function App() {
     <div className="container">
       <header className="app-header">
         <div className="brand">
-          <img src="/app_logo.png" alt="App Logo" className="app-logo" />
-          <div className="title-group">
-            <h1>Spatial Address Pro</h1>
-            <p className="subtitle">AI-Powered Address Normalization</p>
-          </div>
+          <img src="/logo_new.png" alt="Spatial Address Pro" className="app-logo-full" />
         </div>
       </header>
 
@@ -224,13 +268,36 @@ function App() {
       </div>
 
       <div className="card" style={{ marginTop: '1rem' }}>
-        <h3>Bulk Upload (대량 처리 - CSV)</h3>
+        <h3>Bulk Upload (대량 처리 - CSV, 최대 1,000건)</h3>
         <div className="input-row">
-          <div className="address-input compact" style={{ color: '#888', display: 'flex', alignItems: 'center' }}>
-            {loading ? 'Processing...' : (bulkData ? `Processed ${bulkData.count} rows successfully.` : "Upload a CSV file with an 'address' column.")}
+          <div className="address-input compact" style={{ color: '#888', display: 'flex', alignItems: 'center', flexDirection: 'column', gap: '0.5rem' }}>
+            {bulkProcessing ? (
+              <>
+                <div style={{ display: 'flex', justifyContent: 'space-between', width: '100%', fontSize: '0.8rem' }}>
+                  <span>⏳ 정규화 진행 중...</span>
+                  <span>{bulkProgress.current} / {bulkProgress.total}건 ({bulkProgress.percent}%)</span>
+                </div>
+                <div style={{ width: '100%', backgroundColor: '#333', borderRadius: '4px', height: '10px', overflow: 'hidden' }}>
+                  <div
+                    style={{
+                      width: `${bulkProgress.percent}%`,
+                      backgroundColor: '#6366f1',
+                      height: '100%',
+                      transition: 'width 0.3s ease-out'
+                    }}
+                  />
+                </div>
+              </>
+            ) : (
+              bulkData ? `✅ ${bulkData.count}건 처리 완료` : "Upload a CSV file with an 'address' column."
+            )}
           </div>
 
-          {!bulkData ? (
+          {bulkProcessing ? (
+            <button onClick={handleCancelBulk} className="normalize-btn" style={{ backgroundColor: '#ef4444' }}>
+              중단
+            </button>
+          ) : !bulkData ? (
             <label className="normalize-btn" style={{ cursor: 'pointer', margin: 0 }}>
               Select CSV
               <input

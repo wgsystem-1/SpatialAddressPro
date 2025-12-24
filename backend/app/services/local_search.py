@@ -17,6 +17,67 @@ class LocalSearchService:
         "고양시": "고양특례시",
         "창원시": "창원특례시",
     }
+
+    # 시도명 매핑 (약어/별칭 포함)
+    SIDO_MAP = {
+        "서울": "서울특별시", "서울특별시": "서울특별시",
+        "부산": "부산광역시", "부산광역시": "부산광역시",
+        "대구": "대구광역시", "대구광역시": "대구광역시",
+        "인천": "인천광역시", "인천광역시": "인천광역시",
+        "광주": "광주광역시", "광주광역시": "광주광역시",
+        "대전": "대전광역시", "대전광역시": "대전광역시",
+        "울산": "울산광역시", "울산광역시": "울산광역시",
+        "세종": "세종특별자치시", "세종시": "세종특별자치시", "세종특별자치시": "세종특별자치시",
+        "경기": "경기도", "경기도": "경기도",
+        "강원": "강원특별자치도", "강원도": "강원특별자치도", "강원특별자치도": "강원특별자치도",
+        "충북": "충청북도", "충청북도": "충청북도",
+        "충남": "충청남도", "충청남도": "충청남도",
+        "전북": "전북특별자치도", "전라북도": "전북특별자치도", "전북특별자치도": "전북특별자치도",
+        "전남": "전라남도", "전라남도": "전라남도",
+        "경북": "경상북도", "경상북도": "경상북도",
+        "경남": "경상남도", "경상남도": "경상남도",
+        "제주": "제주특별자치도", "제주도": "제주특별자치도", "제주특별자치도": "제주특별자치도"
+    }
+    
+    def _parse_region_hints(self, tokens: list[str]) -> tuple[str | None, str | None]:
+        """토큰 목록에서 시도/시군구 힌트를 추출"""
+        sido_hint = None
+        sgg_hint = None
+        
+        for i, t in enumerate(tokens):
+            # 도로명은 제외 (예: 세종대로에서 '세종'이 시도로 인식되는 것 방지)
+            if t.endswith('로') or t.endswith('길') or t.endswith('대로'):
+                continue
+            
+            # 1. 시도 검색
+            found_sido = False
+            for alias, full_name in self.SIDO_MAP.items():
+                if t == alias or t.startswith(alias):
+                    # '제주'로 시작하는 '제주시' 같은 경우, '제주'는 시도로, '제주시'에서 '제주'를 뺀 '시'가 남음
+                    # 하지만 보통 '제주 제주시'로 입력하므로 t == alias 체크가 안전
+                    if t == alias or t == full_name:
+                        sido_hint = full_name
+                        found_sido = True
+                        break
+                    elif len(t) > len(alias):
+                        # '제주제주시' 같은 경우 처리
+                        rem = t[len(alias):]
+                        if rem.endswith('시') or rem.endswith('군') or rem.endswith('구'):
+                            sido_hint = full_name
+                            sgg_hint = rem
+                            found_sido = True
+                            break
+            
+            if found_sido:
+                continue
+
+            # 2. 시군구 검색 (시도 검색 안 된 경우)
+            if len(t) > 1 and (t.endswith('시') or t.endswith('군') or t.endswith('구')):
+                # '광역시', '특별' 등은 시도가 아니므로 제외
+                if t not in self.SIDO_MAP.values() and "특별" not in t and "광역" not in t:
+                    sgg_hint = t
+        
+        return sido_hint, sgg_hint
     
     def __init__(self, db: Session):
         self.db = db
@@ -44,6 +105,28 @@ class LocalSearchService:
                 alt_sgg = special  # DB에는 특례시로 저장되어 있을 수 있음
         
         return result, alt_sgg
+
+    def _normalize_hancha_numbers(self, text: str) -> str:
+        """
+        한자어 숫자 표현(일동, 이동...)을 아라비아 숫자로 변환
+        예: 일도이동 -> 일도2동, 중앙동일가 -> 중앙동1가
+        """
+        # (구역명)(한자숫자)(동/가/로) 패턴 매칭
+        # 예: 일도(이)(동) -> 일도2동
+        hancha_map = {
+            "일": "1", "이": "2", "삼": "3", "사": "4", "오": "5",
+            "육": "6", "칠": "7", "팔": "8", "구": "9", "십": "10"
+        }
+        
+        result = text
+        for kor, num in hancha_map.items():
+            # (글자들)(일/이/삼...)(동/가/로) 형태를 찾아서 변환
+            # 예: 일도이동 -> 일도2동, 중앙동일가 -> 중앙동1가, 종로이가 -> 종로2가
+            # 단어 끝이거나 공백, 숫자 앞인 경우만 변환
+            pattern = f"([가-힣]+){kor}([동가로])(?=\\s|$|[0-9])"
+            result = re.sub(pattern, f"\\g<1>{num}\\g<2>", result)
+            
+        return result
 
     def _insert_spaces(self, text: str) -> str:
         """
@@ -99,6 +182,9 @@ class LocalSearchService:
         raw_query, alt_sgg = self._normalize_special_city(raw_query)
         if alt_sgg:
             print(f"[DEBUG] Special city detected: alt_sgg='{alt_sgg}'")
+            
+        # 0-A3. Normalize Hancha numbers (일동 -> 1동)
+        raw_query = self._normalize_hancha_numbers(raw_query)
         
         # 0-B. Preprocess: Extract bracket content (reference info)
         # Pattern: "[연동, 대림2차아파트]" or "(연동)" 
@@ -127,6 +213,9 @@ class LocalSearchService:
         # Remove bracket content from query for cleaner parsing
         clean_query = re.sub(r'\[[^\]]+\]', ' ', raw_query)
         clean_query = re.sub(r'\([^\)]+\)', ' ', clean_query)  # Also remove ()
+        
+        # Strip "번지" from numbers like "329-10번지" -> "329-10"
+        clean_query = re.sub(r'(\d+(?:-\d+)?)\s*번지', r'\1', clean_query)
         
         # Handle numbers stuck to brackets: "25[연동]" -> "25 "
         clean_query = re.sub(r'(\d+)\s*\[', r'\1 ', clean_query)
@@ -157,7 +246,11 @@ class LocalSearchService:
                     # Extract number (handle "25" or "25-1" or "25동" etc)
                     num_match = re.match(r'^(\d+)(?:-(\d+))?', next_token)
                     if num_match:
-                        road_num = int(num_match.group(1))
+                        # Preserve full number string including sub-number
+                        if num_match.group(2):
+                            road_num = f"{num_match.group(1)}-{num_match.group(2)}"
+                        else:
+                            road_num = num_match.group(1)
                         break
         
         # Fallback: Check last numeric token
@@ -165,45 +258,24 @@ class LocalSearchService:
             for token in reversed(tokens):
                 num_match = re.match(r'^(\d+)(?:-(\d+))?$', token)
                 if num_match:
-                    road_num = int(num_match.group(1))
+                    # Preserve full number string
+                    if num_match.group(2):
+                        road_num = f"{num_match.group(1)}-{num_match.group(2)}"
+                    else:
+                        road_num = num_match.group(1)
                     break
         
         # Extract road name (scan parts)
         # Extract road name (scan parts)
         # Also try to extract Region (Sido) and District (Sgg) for better filtering
-        sido_hint = None
-        sgg_hint = None
-        
-        # Simple list of major Sido aliases for detection
-        sido_aliases = {
-            "서울": "서울특별시", "부산": "부산광역시", "대구": "대구광역시",
-            "인천": "인천광역시", "광주": "광주광역시", "대전": "대전광역시",
-            "울산": "울산광역시", "세종": "세종특별자치시", "경기": "경기도",
-            "강원": "강원특별자치도", "충북": "충청북도", "충남": "충청남도",
-            "전북": "전북특별자치도", "전남": "전라남도", "경북": "경상북도",
-            "경남": "경상남도", "제주": "제주특별자치도"
-        }
+        # 1.1 Extract Region (Sido) and District (Sgg) for better filtering
+        sido_hint, sgg_hint = self._parse_region_hints(tokens)
 
         # Helper to check if string contains Korean
         def has_korean(text):
             return any(ord('가') <= ord(c) <= ord('힣') for c in text)
 
         for i, t in enumerate(tokens):
-            # Skip road names from sido detection (e.g., 세종대로 should not match 세종)
-            is_road_name = t.endswith('로') or t.endswith('길') or t.endswith('대로')
-            
-            # Detect Sido - but not from road names
-            if not is_road_name:
-                for alias, full_name in sido_aliases.items():
-                    # Match exact token or full name, not substring in road name
-                    if t == alias or t == full_name or t.startswith(full_name):
-                        sido_hint = full_name
-            
-            # Detect Sgg
-            if len(t) > 1 and (t.endswith('구') or t.endswith('군') or t.endswith('시')):
-                if t not in sido_aliases.values() and "특별" not in t and "광역" not in t:
-                    sgg_hint = t
-            
             # Detect Road Name
             if t.endswith('로') or t.endswith('길'):
                 # 1. If starts with digit (e.g. '1로', '3길'), merge with previous token!
@@ -228,7 +300,9 @@ class LocalSearchService:
                     road_num = t
                     print(f"[DEBUG] Assigned Num: {road_num} from token '{t}'")
 
-        if not road_name and not road_num:
+        # If no road name found, generic search is better to avoid matching 
+        # arbitrary roads by building number alone (especially common with Jibun addresses)
+        if not road_name:
             return self._like_search(raw_query)
 
         # [DEBUG]
@@ -364,133 +438,144 @@ class LocalSearchService:
 
     def _like_search(self, raw: str):
         # 1. Parse hints from raw text again just in case search logic bypassed parsing
-        sido_hint = None
-        sgg_hint = None
         emd_hint = None
         
-        # Simple list of major Sido aliases for detection
-        sido_aliases = {
-            "서울": "서울특별시", "부산": "부산광역시", "대구": "대구광역시",
-            "인천": "인천광역시", "광주": "광주광역시", "대전": "대전광역시",
-            "울산": "울산광역시", "세종": "세종특별자치시", "경기": "경기도",
-            "강원": "강원특별자치도", "충북": "충청북도", "충남": "충청남도",
-            "전북": "전북특별자치도", "전남": "전라남도", "경북": "경상북도",
-            "경남": "경상남도", "제주": "제주특별자치도"
-        }
-
         # Clean raw text properly FIRST
-        clean_text = re.sub(r'[^\w\s]', ' ', raw).strip()
+        # Preserve hyphens for house numbers (e.g., 329-10)
+        clean_text = re.sub(r'[^\w\s\-]', ' ', raw).strip()
+        # Strip "번지" from tokens like "329-10번지"
+        clean_text = re.sub(r'(\d+(?:-\d+)?)\s*번지', r'\1', clean_text)
+        
         while '  ' in clean_text: clean_text = clean_text.replace('  ', ' ')
         tokens = clean_text.split()
         
+        sido_hint, sgg_hint = self._parse_region_hints(tokens)
+
         for t in tokens:
-             # Skip road names from sido detection
-             is_road = t.endswith('로') or t.endswith('길') or t.endswith('대로')
-             
-             # Detect Sido - exact match only, not substring
-             if not is_road:
-                 for alias, full_name in sido_aliases.items():
-                     if t == alias or t == full_name or t.startswith(full_name):
-                         sido_hint = full_name
-             
-             # Detect Sgg - but exclude tokens containing sido alias as substring
-             if len(t) > 1 and (t.endswith('구') or t.endswith('군') or t.endswith('시')):
-                 if t not in sido_aliases.values() and "특별" not in t and "광역" not in t:
-                    sgg_hint = t
+             # Detect Dong (EMD) - must end with '동' and NOT start with digits (to avoid building dong like 205동)
+             if len(t) > 1 and t.endswith('동') and not t[0].isdigit():
+                 # Don't overwrite if we already found a likely EMD (EMD usually comes first)
+                 if not emd_hint:
+                     emd_hint = t
+
+
+        
+        is_jibun_likely = any(t.endswith("동") or t.endswith("리") or t.endswith("가") or t.endswith("읍") or t.endswith("면") for t in tokens)
+
+        # 2. Extract core tokens (up to the first number token)
+        # This helps ignore "tail" info like "101ho", "building name" etc.
+        core_tokens = []
+        for t in tokens:
+            # If token is a number (e.g. 329-10)
+            if re.match(r'^\d+(?:-\d+)?$', t):
+                core_tokens.append(t)
+                break
+            # Skip region hints already captured
+            if t == sido_hint or t == sgg_hint:
+                continue
             
-             # Detect Dong (EMD)
-             if len(t) > 1 and t.endswith('동') and not t.isdigit():
-                 emd_hint = t
-
-
+            # To handle "일도2동" vs "일도이동", replace digits with %
+            # This makes "일도2동" -> "일도%동" or "일도이동" -> "일도%동"
+            clean_t = re.sub(r'(\d+|일|이|삼|사|오|육|칠|팔|구|십)', '%', t)
+            core_tokens.append(clean_t)
         
-        is_jibun_likely = any(t.endswith("동") or t.endswith("리") or t.endswith("가") for t in tokens)
-
-        clean_raw = clean_text.replace(" ", "%")
-        
-        query = self.db.query(AddressMaster)
-        
-        # Apply strict filtering if region is detected
-        if sido_hint:
-             query = query.filter(AddressMaster.si_nm.like(f"{sido_hint}%"))
-        if sgg_hint:
-             query = query.filter(AddressMaster.sgg_nm.like(f"%{sgg_hint}%"))
-        
-        # Strategy: Determine if it's likely a Jibun Address (has 'Dong'/'Ri' but no Road Name parsed)
-        # Since we are in _like_search, road_name parsing failed or was empty.
-        
-        if is_jibun_likely:
-            # 1. Try Jibun Search FIRST
-            match = query.filter(AddressMaster.jibun_full_addr.like(f"%{clean_raw}%")).first()
+        if not core_tokens:
+            return None
             
-            # 2. If not found, try Road Search
-            if not match:
-                match = query.filter(AddressMaster.road_full_addr.like(f"%{clean_raw}%")).first()
-        else:
-            # Standard OR search (or Road first?)
-            # Let's try Road first, then Jibun
-            match = query.filter(AddressMaster.road_full_addr.like(f"%{clean_raw}%")).first()
-            if not match:
-                match = query.filter(AddressMaster.jibun_full_addr.like(f"%{clean_raw}%")).first()
+        core_query_part = "%".join(core_tokens)
+        
+        # 3. Tiered Search
+        def try_search(use_sido=True, use_sgg=True):
+            q = self.db.query(AddressMaster)
+            if use_sido and sido_hint:
+                q = q.filter(AddressMaster.si_nm.like(f"{sido_hint}%"))
+            if use_sgg and sgg_hint:
+                q = q.filter(AddressMaster.sgg_nm.like(f"%{sgg_hint}%"))
+            
+            # Separate text and number parts
+            text_part = "%".join(core_tokens[:-1])
+            num_part = core_tokens[-1]
+            
+            # Since jibun_full_addr usually ends with " [Main]-[Sub]",
+            # we try strict match with a leading space to avoid matching 1069-1 when searching 9-1.
+            
+            if is_jibun_likely:
+                # 1. Strict number match (preceded by space AND ends with the number)
+                # This prevents '1506' from matching '1506-11'
+                res = q.filter(AddressMaster.jibun_full_addr.like(f"%{text_part}% {num_part}")).first()
+                if not res:
+                    # 2. Fallback to loose match only if strict fails
+                    res = q.filter(AddressMaster.jibun_full_addr.like(f"%{text_part}% {num_part}%")).first()
+                if not res:
+                    res = q.filter(AddressMaster.road_full_addr.like(f"%{text_part}%{num_part}%")).first()
+            else:
+                # Road search preferred - also try strict first
+                res = q.filter(AddressMaster.road_full_addr.like(f"%{text_part}% {num_part}")).first()
+                if not res:
+                    res = q.filter(AddressMaster.road_full_addr.like(f"%{text_part}%{num_part}%")).first()
+                if not res:
+                    res = q.filter(AddressMaster.jibun_full_addr.like(f"%{text_part}%{num_part}%")).first()
+            return res
+
+        # Attempt 1: Full context
+        match = try_search(True, True)
+        if not match:
+            # Attempt 2: Relax Sido (Maybe just "제주시 ...")
+            match = try_search(False, True)
+        if not match:
+            # Attempt 3: Relax All Region (Last resort)
+            match = try_search(False, False)
 
         if match:
             return self._to_result(match)
 
         # 3. Building Name Search (Smart Fallback)
-        # Construct building search term by removing detected region hints
-        build_tokens = [t for t in tokens if t != sido_hint and t != sgg_hint and t != emd_hint]
+        # Filter tokens that are likely details (X동, X호, X단지 if preceded by number)
+        detail_patterns = [r'\d+동$', r'\d+호$', r'\d+층$', r'\d+단지$']
+        build_tokens = []
+        for t in tokens:
+            if t in [sido_hint, sgg_hint, emd_hint]: continue
+            if any(re.match(p, t) for p in detail_patterns): continue
+            # If it's the house number already used in try_search, skip it? 
+            # Actually build_tokens should be pure building names.
+            if re.match(r'^\d+(?:-\d+)?$', t): continue
+            build_tokens.append(t)
         
         if build_tokens:
-            build_name_query = "%".join(build_tokens)
-            print(f"[DEBUG] Building Search: query={build_name_query}, hints=({sido_hint}, {sgg_hint}, {emd_hint})")
-            
-            # Helper to run query with optional filters
-            # Enhanced to perform space-insensitive search on Building Name
-            def try_build_search(use_sido=True, use_sgg=True, use_emd=True):
-                from sqlalchemy import func
-                q = self.db.query(AddressMaster)
+            def try_build_step(tokens_to_use):
+                query_str = "%".join(tokens_to_use)
+                print(f"[DEBUG] Building Search: query={query_str}, hints=({sido_hint}, {sgg_hint}, {emd_hint})")
                 
-                has_region_filter = False
-                
-                if use_sido and sido_hint:
-                    q = q.filter(AddressMaster.si_nm.like(f"{sido_hint}%"))
-                    has_region_filter = True
-                if use_sgg and sgg_hint:
-                    q = q.filter(AddressMaster.sgg_nm.like(f"%{sgg_hint}%"))
-                    has_region_filter = True
-                if use_emd and emd_hint:
-                    # EMD filter is useful
-                    q = q.filter(AddressMaster.emd_nm.like(f"%{emd_hint}%"))
-                    has_region_filter = True
-                
-                # Performance Check: Only use Heavy Replace logic if we have regional filters
-                # Global Search (no filters) with Function call is too slow.
-                use_heavy = has_region_filter
-                
-                if use_heavy:
-                     stripped_query = build_name_query.replace("%", "").replace(" ", "")
-                     q = q.filter(func.replace(AddressMaster.buld_nm, ' ', '').like(f"%{stripped_query}%"))
-                else:
-                     # Standard Like for Global Search
-                     q = q.filter(AddressMaster.buld_nm.like(f"%{build_name_query}%"))
-                
-                return q.first()
+                def run_q(use_sido=True, use_sgg=True, use_emd=True):
+                    from sqlalchemy import func
+                    q = self.db.query(AddressMaster)
+                    if use_sido and sido_hint: q = q.filter(AddressMaster.si_nm.like(f"{sido_hint}%"))
+                    if use_sgg and sgg_hint: q = q.filter(AddressMaster.sgg_nm.like(f"%{sgg_hint}%"))
+                    if use_emd and emd_hint: q = q.filter(AddressMaster.emd_nm.like(f"%{emd_hint}%"))
+                    
+                    # Space-insensitive matching
+                    stripped = query_str.replace("%", "").replace(" ", "")
+                    if stripped:
+                        q = q.filter(func.replace(AddressMaster.buld_nm, ' ', '').like(f"%{stripped}%"))
+                        return q.first()
+                    return None
 
-            # Attempt 1: Strict (All hints)
-            match = try_build_search(True, True, True)
+                # Tiered region matching for building
+                m = run_q(True, True, True)
+                if not m: m = run_q(True, True, False)
+                if not m: m = run_q(False, True, False)
+                if not m: m = run_q(False, False, False)
+                return m
+
+            # Attempt 1: Full building name tokens
+            match = try_build_step(build_tokens)
             if match: return self._to_result(match)
             
-            # Attempt 2: Relax EMD (In case Dong is missing in DB or mismatches)
-            if emd_hint:
-                print(f"[DEBUG] Relaxing EMD filter...")
-                match = try_build_search(True, True, False)
+            # Attempt 2: If many tokens, try just the first 2 (often the main apartment name)
+            if len(build_tokens) > 2:
+                print(f"[DEBUG] Falling back to first 2 building tokens: {build_tokens[:2]}")
+                match = try_build_step(build_tokens[:2])
                 if match: return self._to_result(match)
-
-            # Attempt 3: Relax SGG (In case SGG mismatches)
-            if sgg_hint:
-                 print(f"[DEBUG] Relaxing SGG filter...")
-                 match = try_build_search(True, False, False)
-                 if match: return self._to_result(match)
             
             # Attempt 4: Search Only Building Name (Broadest)
             # Only do this if we have a reasonably specific building name (length check?)
@@ -527,7 +612,7 @@ class LocalSearchService:
             sgg_nm=obj.sgg_nm,
             emd_nm=obj.emd_nm,
             buld_nm=obj.buld_nm,
-            bd_mgt_sn=None,
+            bd_mgt_sn=obj.mgmt_no,
             is_ai_corrected=False,
             message="Matched via Local DB (Fast)"
         )
@@ -539,6 +624,9 @@ class LocalSearchService:
         """
         # Apply space insertion for concatenated input
         query = self._insert_spaces(query)
+        
+        # Apply Hancha number normalization
+        query = self._normalize_hancha_numbers(query)
         
         # Clean query
         clean_query = re.sub(r'[^\w\s\-]', ' ', query).strip()
@@ -557,17 +645,7 @@ class LocalSearchService:
         detail_dong = None  # 201동 같은 상세주소
         building_name_hint = None
         
-        sido_hint = None
-        sgg_hint = None
-        
-        sido_aliases = {
-            "서울": "서울특별시", "부산": "부산광역시", "대구": "대구광역시",
-            "인천": "인천광역시", "광주": "광주광역시", "대전": "대전광역시",
-            "울산": "울산광역시", "세종": "세종특별자치시", "경기": "경기도",
-            "강원": "강원특별자치도", "충북": "충청북도", "충남": "충청남도",
-            "전북": "전북특별자치도", "전남": "전라남도", "경북": "경상북도",
-            "경남": "경상남도", "제주": "제주특별자치도"
-        }
+        sido_hint, sgg_hint = self._parse_region_hints(tokens)
         
         for i, t in enumerate(tokens):
             # Road name detection (ends with 로/길/대로)
@@ -588,21 +666,12 @@ class LocalSearchService:
             elif re.match(r'^\d+동$', t):
                 detail_dong = t
             
-            # Sido detection
-            is_road = t.endswith('로') or t.endswith('길') or t.endswith('대로')
-            if not is_road:
-                for alias, full_name in sido_aliases.items():
-                    if t == alias or t == full_name or t.startswith(full_name):
-                        sido_hint = full_name
-            
-            # Sgg detection
-            if len(t) > 1 and (t.endswith('구') or t.endswith('군')):
-                if t not in sido_aliases.values() and "특별" not in t and "광역" not in t:
-                    sgg_hint = t
-            
-            # Building name hint (아파트, 빌딩, 타워 등 포함)
-            if '아파트' in t or '빌딩' in t or '타워' in t or '밸리' in t or '센터' in t or '오피스텔' in t:
-                building_name_hint = t
+            # Building name hint (korean characters, not road, not num, not sido/sgg)
+            # If token is not already identified as something else
+            elif len(t) > 1 and not road_name and not road_num and not detail_dong:
+                # If it's not the sido/sgg we already found
+                if t != sido_hint and t != sgg_hint:
+                    building_name_hint = t
         
         print(f"[DEBUG] Parsed: road={road_name}, num={road_num}, detail_dong={detail_dong}, building={building_name_hint}, sido={sido_hint}, sgg={sgg_hint}")
         

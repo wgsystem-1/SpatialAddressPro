@@ -66,6 +66,14 @@ body {
   border-radius: 12px;
 }
 
+/* New full horizontal logo (icon + text combined) */
+.app-logo-full {
+  height: 72px;
+  width: auto;
+  max-width: 480px;
+  object-fit: contain;
+}
+
 .title-group h1 {
   margin: 0;
   font-size: 1.5rem;

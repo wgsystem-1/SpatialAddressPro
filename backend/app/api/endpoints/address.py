@@ -1,10 +1,11 @@
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, BackgroundTasks
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from typing import List
 from app.db.session import get_db
 from app.models.address import AddressLog
 from app.schemas.address import AddressCreate, AddressResponse, NormalizationResult
+import threading
 
 router = APIRouter()
 
@@ -12,11 +13,75 @@ from app.services.juso_service import juso_service
 from app.services.llm_service import llm_service
 from app.services.local_search import LocalSearchService
 from app.db.session import SessionLocal
+import uuid
+import time
 
-def _normalize_logic(raw: str) -> NormalizationResult:
+# Session-based job management for concurrent bulk processing
+class BulkJobManager:
+    def __init__(self):
+        self.jobs = {}  # {job_id: state_dict}
+        self.lock = threading.Lock()
+        self.max_jobs = 100  # Limit to prevent memory issues
+        self.job_ttl = 3600  # 1 hour TTL for cleanup
+    
+    def create_job(self) -> str:
+        """Create a new job and return its ID"""
+        job_id = str(uuid.uuid4())[:8]
+        with self.lock:
+            # Cleanup old jobs if at limit
+            self._cleanup_old_jobs()
+            
+            self.jobs[job_id] = {
+                "is_running": True,
+                "is_cancelled": False,
+                "current_row": 0,
+                "total_rows": 0,
+                "created_at": time.time(),
+                "results": None,  # Will store the final JSON data
+                "filename": ""    # Original filename
+            }
+        return job_id
+    
+    def get_job(self, job_id: str) -> dict | None:
+        return self.jobs.get(job_id)
+    
+    def update_job(self, job_id: str, **kwargs):
+        with self.lock:
+            if job_id in self.jobs:
+                self.jobs[job_id].update(kwargs)
+    
+    def cancel_job(self, job_id: str) -> bool:
+        with self.lock:
+            if job_id in self.jobs:
+                self.jobs[job_id]["is_cancelled"] = True
+                return True
+            return False
+    
+    def finish_job(self, job_id: str, results=None):
+        with self.lock:
+            if job_id in self.jobs:
+                self.jobs[job_id]["is_running"] = False
+                if results is not None:
+                    self.jobs[job_id]["results"] = results
+    
+    def _cleanup_old_jobs(self):
+        """Remove jobs older than TTL (1 hour)"""
+        now = time.time()
+        expired = [jid for jid, state in self.jobs.items() 
+                   if now - state.get("created_at", 0) > self.job_ttl]
+        for jid in expired:
+            del self.jobs[jid]
+
+# Global job manager instance
+bulk_job_manager = BulkJobManager()
+
+
+def _normalize_logic(raw: str, bulk_mode: bool = False) -> NormalizationResult:
     """
     Local-Only Normalization Logic
     Flow: Local DB -> (fail) -> LLM Correction -> Local DB -> (fail) -> Error
+    
+    bulk_mode: If True, skip LLM calls for faster processing
     """
     db = SessionLocal()
     local_service = LocalSearchService(db)
@@ -28,7 +93,15 @@ def _normalize_logic(raw: str) -> NormalizationResult:
             print(f"DEBUG: Local Hit! {local_result.refined_address}")
             return local_result
 
-        # 2. If Failed, Try LLM Correction (Local Ollama)
+        # 2. If bulk_mode, skip LLM and return immediately with needs_review status
+        if bulk_mode:
+            return NormalizationResult(
+                success=False,
+                is_ai_corrected=False,
+                message="needs_review"  # Special marker for bulk mode failures
+            )
+
+        # 3. If Failed, Try LLM Correction (Local Ollama)
         print(f"DEBUG: Attempting AI Correction for: {raw}")
         corrected_text = llm_service.correct_address(raw)
         
@@ -47,18 +120,13 @@ def _normalize_logic(raw: str) -> NormalizationResult:
     finally:
         db.close()
 
-    # 3. Fallback / Failure
+    # 4. Fallback / Failure
     return NormalizationResult(
         success=False,
         is_ai_corrected=False,
         message="Address not found in Local DB."
     )
-            
-    return NormalizationResult(
-        success=False,
-        is_ai_corrected=False,
-        message=f"Address not found. Final Error: {search_result.get('error')}"
-    )
+
 
 @router.post("/normalize", response_model=AddressResponse)
 def normalize_address(
@@ -124,17 +192,72 @@ def search_address_candidates(query: str, limit: int = 10, db: Session = Depends
         "candidates": candidates
     }
 
-@router.post("/bulk-normalize")
-async def bulk_normalize_address(file: UploadFile = File(...), db: Session = Depends(get_db)):
-    """
-    Bulk Normalize from CSV
-    - Expects a CSV file with a column named 'address' or the first column will be used.
-    - Returns a CSV file with appended columns.
-    """
-    from app.utils.csv_handler import read_csv_file, df_to_csv_bytes
-    from fastapi.responses import StreamingResponse
+def _run_bulk_processing(job_id: str, df: "pd.DataFrame", target_col: str, filename: str):
+    """Background worker for bulk processing"""
     import io
     import pandas as pd
+    
+    results = []
+    try:
+        for idx, row in df.iterrows():
+            job = bulk_job_manager.get_job(job_id)
+            if not job or job.get("is_cancelled"):
+                break
+                
+            bulk_job_manager.update_job(job_id, current_row=idx + 1)
+            
+            raw_addr = str(row[target_col])
+            res = _normalize_logic(raw_addr, bulk_mode=False) 
+            
+            if res.success:
+                status_val = "success"
+                err_val = "AI 보정 완료" if res.is_ai_corrected else ""
+            else:
+                status_val = "fail"
+                err_val = res.message if res.message else "검색 실패"
+            
+            results.append({
+                "refined_address": res.refined_address,
+                "road_address": res.road_address,
+                "zip_code": res.zip_code,
+                "si_nm": res.si_nm,
+                "sgg_nm": res.sgg_nm,
+                "buld_nm": res.buld_nm,
+                "status": status_val,
+                "error_info": err_val
+            })
+            
+        # Completion
+        result_df = pd.DataFrame(results)
+        final_df = pd.concat([df.reset_index(drop=True), result_df], axis=1)
+        data_list = final_df.fillna("").to_dict(orient="records")
+        
+        csv_buffer = io.StringIO()
+        final_df.to_csv(csv_buffer, index=False, encoding='utf-8-sig')
+        csv_content = csv_buffer.getvalue()
+
+        bulk_job_manager.finish_job(job_id, results={
+            "count": len(data_list),
+            "results": data_list,
+            "csv_content": csv_content,
+            "filename": f"refined_{filename}"
+        })
+    except Exception as e:
+        print(f"Bulk Background Error: {e}")
+        bulk_job_manager.finish_job(job_id)
+
+
+@router.post("/bulk-normalize")
+async def bulk_normalize_address(
+    background_tasks: BackgroundTasks, 
+    file: UploadFile = File(...), 
+    db: Session = Depends(get_db)
+):
+    """
+    Bulk Normalize from CSV (Asynchronous)
+    - Returns job_id immediately.
+    """
+    from app.utils.csv_handler import read_csv_file
     
     # 1. Read CSV
     try:
@@ -142,65 +265,31 @@ async def bulk_normalize_address(file: UploadFile = File(...), db: Session = Dep
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid CSV file: {str(e)}")
     
+    # 1-1. Row Limit Check
+    MAX_ROWS = 1000
+    if len(df) > MAX_ROWS:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"CSV 파일이 너무 큽니다. 최대 {MAX_ROWS:,}건까지 처리 가능합니다."
+        )
+    
     # 2. Identify Address Column
-    # Check for likely names ['address', 'juso', 'addr', '주소']
     target_col = None
     candidates = ['address', 'addr', 'juso', '주소', 'raw_text']
-    
     for col in df.columns:
         if col.lower() in candidates:
             target_col = col
             break
-            
     if not target_col:
-        # Fallback to first column
         target_col = df.columns[0]
 
-    # 3. Process Rows (Synchronous for now, intended for small batches < 1000)
-    results = []
+    # 3. Create Job and Start Background Task
+    job_id = bulk_job_manager.create_job()
+    bulk_job_manager.update_job(job_id, total_rows=len(df), filename=file.filename)
     
-    # Pre-calculate to avoid DB overhead per row if possible, 
-    # but for logging we might want to save. Let's just process purely first.
+    background_tasks.add_task(_run_bulk_processing, job_id, df, target_col, file.filename)
     
-    for idx, row in df.iterrows():
-        raw_addr = str(row[target_col])
-        res = _normalize_logic(raw_addr)
-        
-        # Determine status/error for CSV
-        status_val = "success" if res.success else "fail"
-        err_val = res.message if not res.success else ""
-        
-        results.append({
-            "refined_address": res.refined_address,
-            "road_address": res.road_address,
-            "zip_code": res.zip_code,
-            "si_nm": res.si_nm,
-            "sgg_nm": res.sgg_nm,
-            "buld_nm": res.buld_nm,
-            "status": status_val,
-            "error_info": err_val
-        })
-        
-    # 4. Append Results to DataFrame
-    result_df = pd.DataFrame(results)
-    final_df = pd.concat([df.reset_index(drop=True), result_df], axis=1)
-    
-    # 5. Prepare Response
-    # Convert to list of dicts for JSON response (replace NaN with empty string)
-    data_list = final_df.fillna("").to_dict(orient="records")
-    
-    # Generate CSV string for client-side download
-    # Using utf-8-sig for Excel compatibility
-    csv_buffer = io.StringIO()
-    final_df.to_csv(csv_buffer, index=False, encoding='utf-8-sig')
-    csv_content = csv_buffer.getvalue()
-
-    return {
-        "count": len(data_list),
-        "results": data_list,
-        "csv_content": csv_content,
-        "filename": f"refined_{file.filename}"
-    }
+    return {"job_id": job_id, "message": "Bulk processing started."}
 
 @router.get("/debug-db")
 def debug_local_db(q: str = "테헤란로", db: Session = Depends(get_db)):
@@ -229,4 +318,49 @@ def debug_local_db(q: str = "테헤란로", db: Session = Depends(get_db)):
         "search_query": q,
         "found_count": len(sample_data),
         "samples": sample_data
+    }
+
+
+@router.get("/bulk-status/{job_id}")
+async def get_bulk_status(job_id: str):
+    """Get bulk processing status for a specific job"""
+    job = bulk_job_manager.get_job(job_id)
+    if not job:
+        return {
+            "is_running": False,
+            "is_cancelled": False,
+            "current_row": 0,
+            "total_rows": 0,
+            "progress_percent": 0,
+            "error": "Job not found"
+        }
+    
+    return {
+        "is_running": job["is_running"],
+        "is_cancelled": job["is_cancelled"],
+        "current_row": job["current_row"],
+        "total_rows": job["total_rows"],
+        "progress_percent": (
+            round(job["current_row"] / job["total_rows"] * 100, 1)
+            if job["total_rows"] > 0 else 0
+        ),
+        "results_data": job.get("results") # This will be present only when is_running is False
+    }
+
+
+@router.post("/bulk-cancel/{job_id}")
+async def cancel_bulk_processing(job_id: str):
+    """Cancel ongoing bulk processing for a specific job"""
+    job = bulk_job_manager.get_job(job_id)
+    if not job:
+        return {"success": False, "message": "Job을 찾을 수 없습니다."}
+    
+    if not job["is_running"]:
+        return {"success": False, "message": "현재 진행 중인 처리가 없습니다."}
+    
+    bulk_job_manager.cancel_job(job_id)
+    
+    return {
+        "success": True, 
+        "message": f"중단 요청됨. 현재 진행: {job['current_row']}/{job['total_rows']}건"
     }
